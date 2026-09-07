@@ -1,0 +1,18 @@
+{
+  "enabled": false,
+  "pin": "",
+  "unlockSwipe": {
+    "startXRatio": 0.5,
+    "startYRatio": 0.86,
+    "endXRatio": 0.5,
+    "endYRatio": 0.2,
+    "durationMs": 500
+  },
+  "pinKeypadFallback": {
+    "enabled": false,
+    "preferCoordinates": false,
+    "tapMethod": "shizuku",
+    "xRatios": [0.25, 0.5, 0.75],
+    "yRatios": [0.44, 0.55, 0.66, 0.78]
+  }
+}
