@@ -10,13 +10,14 @@
 "auto";
 
 var CFG = {
-    scriptVersion: "2026-09-06.12",
+    scriptVersion: "2026-09-09.13",
     wechatPackage: "com.tencent.mm",
     miniProgramName: "微信支付提现笔笔省",
 
     launchWait: 4000,
     searchWait: 2500,
     miniProgramWait: 7000,
+    claimConfirmWait: 5000,
     selectorTimeout: 1200,
     maxStepAttempts: 2,
 
@@ -34,8 +35,9 @@ var CFG = {
     // 顶部小程序卡片不存在时，下方列表的第一条选项中心。
     firstSuggestionXRatio: 0.50,
     firstSuggestionYRatio: 0.335,
-    claimXRatio: 183 / 710,
-    claimYRatio: 1114 / 1536,
+    // 当前页面左侧“50 提现券”的领取按钮中心。禁止点击右侧领券活动。
+    claimXRatio: 0.258,
+    claimYRatio: 0.665,
 
     unlockConfigFile: "unlockConfig.json"
 };
@@ -48,7 +50,8 @@ var STATE = {
     searchPageOpened: false,
     searchQuerySubmitted: false,
     resultOpenedByFallback: false,
-    shizukuUsedForUnlock: false
+    shizukuUsedForUnlock: false,
+    wechatBackgroundReset: false
 };
 
 var DANGEROUS_WORDS = [
@@ -363,6 +366,48 @@ function ensureUnlocked() {
         fail("设备已锁屏，但未提供启用的本地 unlockConfig.json");
     }
     return unlockWithPin(unlockConfig.pin, unlockConfig);
+}
+
+function shizukuOutput(shellResult) {
+    try {
+        return String(shellResult && shellResult.result || "").trim();
+    } catch (e) {
+        return "";
+    }
+}
+
+function resetWechatBackgroundIfRunning() {
+    if (typeof shizuku !== "function") {
+        logWarn("当前 AutoJs6 不支持 Shizuku，无法检查微信后台；继续使用原启动流程");
+        return true;
+    }
+
+    var runningPids = "";
+    try {
+        runningPids = shizukuOutput(shizuku("pidof " + CFG.wechatPackage));
+    } catch (checkError) {
+        logWarn("无法通过 Shizuku 检查微信后台：" + errorMessage(checkError) + "；继续使用原启动流程");
+        return true;
+    }
+
+    if (!runningPids) {
+        logInfo("微信后台当前未运行，直接进入正常启动流程");
+        return true;
+    }
+
+    logInfo("检测到微信后台进程，启动前彻底停止一次");
+    try {
+        shizuku("am force-stop " + CFG.wechatPackage);
+        sleepQuietly(900);
+        var remainingPids = shizukuOutput(shizuku("pidof " + CFG.wechatPackage));
+        if (remainingPids) fail("微信后台进程未能彻底停止");
+        STATE.wechatBackgroundReset = true;
+        STATE.wechatStarted = false;
+        logInfo("微信后台已清理，接下来从冷启动进入");
+        return true;
+    } catch (stopError) {
+        fail("清理微信后台失败：" + errorMessage(stopError));
+    }
 }
 
 function plusMenuOpen() {
@@ -684,10 +729,35 @@ function openMiniProgramFromResults() {
     return STATE.miniProgramOpened;
 }
 
+function nodeInDailyCouponArea(node) {
+    if (!node) return false;
+    try {
+        var bounds = node.bounds();
+        return bounds.centerX() < device.width * 0.52 &&
+               bounds.centerY() > device.height * 0.48 &&
+               bounds.centerY() < device.height * 0.82;
+    } catch (e) {
+        return false;
+    }
+}
+
+function selectorHasNodeInDailyCouponArea(selector) {
+    var nodes = selector.find();
+    for (var i = 0; i < nodes.size(); i++) {
+        if (nodeInDailyCouponArea(nodes.get(i))) return true;
+    }
+    return false;
+}
+
 function alreadyClaimed() {
-    var words = ["今日已领取", "已领取", "明日再来", "领取成功"];
+    // “领取成功”可能是居中的结果提示，可直接作为成功确认。
+    if (textContains("领取成功").exists() || descContains("领取成功").exists()) return true;
+
+    // 页面还有其他活动卡片，只有左侧每日 50 提现券区域的已领取文案才有效。
+    var words = ["今日已领取", "已领取", "明日再来"];
     for (var i = 0; i < words.length; i++) {
-        if (textContains(words[i]).exists() || descContains(words[i]).exists()) return true;
+        if (selectorHasNodeInDailyCouponArea(textContains(words[i])) ||
+            selectorHasNodeInDailyCouponArea(descContains(words[i]))) return true;
     }
     return false;
 }
@@ -707,7 +777,7 @@ function findClaimButton() {
         var nodes = text(labels[i]).find();
         for (var j = 0; j < nodes.size(); j++) {
             var node = nodes.get(j);
-            if (node.bounds().centerY() > device.height * 0.25) return node;
+            if (nodeInDailyCouponArea(node)) return node;
         }
     }
     return null;
@@ -732,14 +802,14 @@ function tryClaimOnce() {
     } else {
         var x = Math.floor(device.width * CFG.claimXRatio);
         var y = Math.floor(device.height * CFG.claimYRatio);
-        logWarn("领取 selector 不可用，沿用已验证坐标 press 一次");
+        logWarn("领取 selector 不可用，点击左侧每日 50 提现券按钮一次");
         console.log("[笔笔省] claim = " + x + "," + y);
         // 保留当前项目已经成功跑通的领取动作，不重试、不连点。
         press(x, y, 120);
     }
 
     STATE.claimPressed = true;
-    sleepQuietly(2800);
+    sleepQuietly(CFG.claimConfirmWait);
     guardDangerousPage();
     if (alreadyClaimed()) {
         logInfo("已确认领取完成");
@@ -747,6 +817,42 @@ function tryClaimOnce() {
     }
     logWarn("领取已点击一次，但页面未暴露可识别的成功文案；不会再次点击");
     return "pressed_once";
+}
+
+function sendResultNotification(result, failureMessage) {
+    if (typeof notice !== "function") {
+        logWarn("当前 AutoJs6 不支持 notice 通知模块");
+        return false;
+    }
+
+    var title = "微信提现券任务";
+    var content = "";
+    if (result === "claimed") {
+        title = "微信提现券：领取成功";
+        content = "页面已经确认今日提现券领取完成。";
+    } else if (result === "already_claimed") {
+        title = "微信提现券：今日已领取";
+        content = "检测到今日已领取，本次没有重复点击。";
+    } else if (result === "pressed_once") {
+        title = "微信提现券：请检查结果";
+        content = "已点击左侧每日提现券一次，但页面未返回可识别的成功文案。";
+    } else {
+        title = "微信提现券：运行失败";
+        content = failureMessage || "脚本未能完成领取，请查看 AutoJs6 日志。";
+    }
+
+    try {
+        if (typeof notice.isEnabled === "function" && !notice.isEnabled()) {
+            logWarn("AutoJs6 通知权限未开启，无法发送结果通知");
+            return false;
+        }
+        notice(title, content, { isSilent: true, autoCancel: true });
+        logInfo("已发送任务结果通知：" + title);
+        return true;
+    } catch (noticeError) {
+        logWarn("发送任务结果通知失败：" + errorMessage(noticeError));
+        return false;
+    }
 }
 
 function leaveWechat() {
@@ -802,6 +908,7 @@ function main() {
     logInfo("脚本版本：" + CFG.scriptVersion);
     wakeScreen();
     ensureUnlocked();
+    resetWechatBackgroundIfRunning();
 
     retryStep("启动微信", launchWechat);
     retryStep("打开微信搜索页", openSearchPage);
@@ -811,12 +918,15 @@ function main() {
 }
 
 var finalResult = "failed";
+var finalErrorMessage = "";
 try {
     finalResult = main();
     logInfo("任务结束：" + finalResult);
 } catch (e) {
-    console.error("[笔笔省] 安全退出：" + errorMessage(e));
+    finalErrorMessage = errorMessage(e);
+    console.error("[笔笔省] 安全退出：" + finalErrorMessage);
 } finally {
+    sendResultNotification(finalResult, finalErrorMessage);
     leaveWechat();
     turnScreenOff();
 }
