@@ -10,7 +10,7 @@
 "auto";
 
 var CFG = {
-    scriptVersion: "2026-09-09.13",
+    scriptVersion: "2026-09-09.14",
     wechatPackage: "com.tencent.mm",
     miniProgramName: "微信支付提现笔笔省",
 
@@ -762,6 +762,119 @@ function alreadyClaimed() {
     return false;
 }
 
+function successDetailPageVisibleBySelector() {
+    return textContains("50提现免费券").exists() ||
+           descContains("50提现免费券").exists() ||
+           textContains("领取后365天内可用").exists() ||
+           descContains("领取后365天内可用").exists() ||
+           textMatches(/已领取.*回首页/).exists() ||
+           descMatches(/已领取.*回首页/).exists();
+}
+
+function pixelRgb(image, xRatio, yRatio) {
+    var x = Math.max(0, Math.min(image.getWidth() - 1,
+        Math.floor(image.getWidth() * xRatio)));
+    var y = Math.max(0, Math.min(image.getHeight() - 1,
+        Math.floor(image.getHeight() * yRatio)));
+    var color = images.pixel(image, x, y);
+    return {
+        red: colors.red(color),
+        green: colors.green(color),
+        blue: colors.blue(color)
+    };
+}
+
+function isWhitePixel(rgb) {
+    return rgb.red >= 225 && rgb.green >= 225 && rgb.blue >= 225;
+}
+
+function isCouponGreenPixel(rgb) {
+    return rgb.green >= 120 &&
+           rgb.green - rgb.red >= 35 &&
+           rgb.green - rgb.blue >= 10;
+}
+
+function successDetailImageMatches(image) {
+    // 图二特征：背景上半部被遮罩压暗，约 30% 高度开始为白色弹窗，
+    // 弹窗中央上方存在面积较大的绿色 50 提现券卡片。
+    var dimmedTop = pixelRgb(image, 0.50, 0.23);
+    var dimmedBrightness = (dimmedTop.red + dimmedTop.green + dimmedTop.blue) / 3;
+
+    var whiteSamples = [
+        pixelRgb(image, 0.08, 0.34),
+        pixelRgb(image, 0.92, 0.34),
+        pixelRgb(image, 0.08, 0.60),
+        pixelRgb(image, 0.92, 0.60)
+    ];
+    var whiteCount = 0;
+    for (var i = 0; i < whiteSamples.length; i++) {
+        if (isWhitePixel(whiteSamples[i])) whiteCount++;
+    }
+
+    var greenCount = 0;
+    var sampleCount = 0;
+    for (var row = 0; row < 8; row++) {
+        for (var column = 0; column < 9; column++) {
+            var sample = pixelRgb(
+                image,
+                0.32 + column * 0.045,
+                0.37 + row * 0.020
+            );
+            if (isCouponGreenPixel(sample)) greenCount++;
+            sampleCount++;
+        }
+    }
+
+    return dimmedBrightness < 210 &&
+           whiteCount >= 3 &&
+           greenCount >= Math.floor(sampleCount * 0.32);
+}
+
+function successDetailPageVisibleByImage() {
+    if (typeof shizuku !== "function") {
+        logWarn("Shizuku 不可用，无法进行领取成功页面视觉确认");
+        return false;
+    }
+
+    var sdcardPath = "/sdcard";
+    try { sdcardPath = files.getSdcardPath(); } catch (e) {}
+    var screenshotPath = files.join(sdcardPath, ".wechat_coupon_success_check.png");
+    var image = null;
+
+    try {
+        shizuku("rm -f " + screenshotPath + "; screencap -p " + screenshotPath);
+        sleepQuietly(350);
+        if (!files.exists(screenshotPath)) {
+            logWarn("领取成功页面临时截图未生成");
+            return false;
+        }
+        image = images.read(screenshotPath);
+        if (!image) {
+            logWarn("无法读取领取成功页面临时截图");
+            return false;
+        }
+        var matched = successDetailImageMatches(image);
+        logInfo(matched ?
+            "已通过图二视觉结构确认领取成功" :
+            "未检测到图二领取成功详情页");
+        return matched;
+    } catch (imageError) {
+        logWarn("领取成功页面视觉确认失败：" + errorMessage(imageError));
+        return false;
+    } finally {
+        try { if (image) image.recycle(); } catch (recycleError) {}
+        try { shizuku("rm -f " + screenshotPath); } catch (removeError) {}
+    }
+}
+
+function successDetailPageVisible() {
+    if (successDetailPageVisibleBySelector()) {
+        logInfo("已通过图二专属文案确认领取成功");
+        return true;
+    }
+    return successDetailPageVisibleByImage();
+}
+
 function findClaimButton() {
     var labels = [
         "领取",
@@ -811,12 +924,12 @@ function tryClaimOnce() {
     STATE.claimPressed = true;
     sleepQuietly(CFG.claimConfirmWait);
     guardDangerousPage();
-    if (alreadyClaimed()) {
+    if (alreadyClaimed() || successDetailPageVisible()) {
         logInfo("已确认领取完成");
         return "claimed";
     }
-    logWarn("领取已点击一次，但页面未暴露可识别的成功文案；不会再次点击");
-    return "pressed_once";
+    logWarn("领取已点击一次，但未出现图二领取成功详情页；判定领取失败且不再次点击");
+    return "claim_failed";
 }
 
 function sendResultNotification(result, failureMessage) {
@@ -833,9 +946,9 @@ function sendResultNotification(result, failureMessage) {
     } else if (result === "already_claimed") {
         title = "微信提现券：今日已领取";
         content = "检测到今日已领取，本次没有重复点击。";
-    } else if (result === "pressed_once") {
-        title = "微信提现券：请检查结果";
-        content = "已点击左侧每日提现券一次，但页面未返回可识别的成功文案。";
+    } else if (result === "claim_failed") {
+        title = "微信提现券：领取失败";
+        content = "已点击左侧每日提现券一次，但未出现50提现免费券成功详情页。";
     } else {
         title = "微信提现券：运行失败";
         content = failureMessage || "脚本未能完成领取，请查看 AutoJs6 日志。";
